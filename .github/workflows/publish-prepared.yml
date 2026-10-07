@@ -1,0 +1,77 @@
+name: Publish prepared packages
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing draft release tag
+        required: true
+      win_url:
+        description: Temporary Windows artifact URL
+        required: true
+      mac_url:
+        description: Temporary macOS artifact URL
+        required: true
+      linux_url:
+        description: Temporary Linux artifact URL
+        required: true
+permissions:
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download prepared packages
+        env:
+          WIN_URL: ${{ inputs.win_url }}
+          MAC_URL: ${{ inputs.mac_url }}
+          LINUX_URL: ${{ inputs.linux_url }}
+        run: |
+          echo "::add-mask::$WIN_URL"
+          echo "::add-mask::$MAC_URL"
+          echo "::add-mask::$LINUX_URL"
+          python - <<'PY'
+          import os, urllib.request, urllib.parse, zipfile
+          from pathlib import Path
+          for platform in ('win', 'mac', 'linux'):
+              url = os.environ[platform.upper() + '_URL']
+              parsed = urllib.parse.urlparse(url)
+              if parsed.scheme != 'https' or not (parsed.hostname or '').endswith('.blob.core.windows.net'):
+                  raise ValueError('Expected a GitHub Actions Azure artifact URL')
+              archive = Path(platform + '.zip')
+              urllib.request.urlretrieve(url, archive)
+              destination = Path('assets', platform).resolve()
+              with zipfile.ZipFile(archive) as package:
+                  for entry in package.infolist():
+                      target = (destination / entry.filename).resolve()
+                      if not target.is_relative_to(destination):
+                          raise ValueError('Invalid artifact path')
+                  package.extractall(destination)
+              print('Downloaded ' + platform)
+          PY
+      - name: Verify update feeds and package hashes
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          ruby -ryaml -rdigest -rtime <<'RUBY'
+          {'win'=>'latest.yml', 'mac'=>'latest-mac.yml', 'linux'=>'latest-linux.yml'}.each do |platform, feed|
+            dir = File.join('assets', platform)
+            data = YAML.safe_load(File.read(File.join(dir, feed)), permitted_classes: [Time])
+            abort 'Version mismatch' unless 'v' + data.fetch('version') == ENV.fetch('RELEASE_TAG')
+            data.fetch('files').each do |entry|
+              name = entry.fetch('url')
+              abort 'Invalid filename' unless name == File.basename(name)
+              file = File.join(dir, name)
+              abort 'Size mismatch' if entry['size'] && File.size(file) != entry['size']
+              abort 'Hash mismatch' unless Digest::SHA512.file(file).base64digest == entry.fetch('sha512')
+              puts "Verified #{platform}: #{name}"
+            end
+          end
+          RUBY
+      - name: Upload to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          gh release upload "$RELEASE_TAG" assets/*/* --repo "$GITHUB_REPOSITORY" --clobber
